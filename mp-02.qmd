@@ -1,0 +1,356 @@
+---
+title: "Mini-Project 02 - Advancing Housing Accessibility Across America"
+author: "Racheal"
+editor:
+    mode: source
+format:
+    html:
+        code-fold: true
+        code-summary: "Display code"
+        reference-location: margin
+        citation-location: margin
+execute:
+  message: false
+  warning: false
+resources:
+  - policy-document.pdf
+---
+
+## Introduction
+
+::: {.callout-note icon=false}
+## Project Overview
+From the [STA 9750 Course Assignment Page](https://michael-weylandt.com/STA9750/miniprojects/mini02.html):
+
+> "Housing affordability is one of the greatest challenges facing New York City today. ... In this mini-project, we will identify America's most 'YIMBY' cities using a variety of census data sources and real estate indices. ... You will use the results of your analysis to lobby politicians in support of a federal YIMBY-incentive program."
+:::
+
+The objective of this analysis is to develop data analysis capabilities, analytical reasoning, and professional communication competencies. By leveraging R programming skills and analytical methods acquired throughout this course, this document will produce a mock policy brief demonstrating the significance of the YIMBY ("yes in my backyard") initiative using empirical data. 
+
+This document builds upon methodologies employed in [Mini-Project 1](https://rcutsumpas-cloud.github.io/STA9750-2025-FALL/mp01.html), incorporating enhanced data processing techniques, developing visual representations to communicate data narratives, and consolidating intricate information into accessible outputs for diverse audience expertise levels. 
+
+::: {.callout-important icon=false}
+## Document Structure
+*Initial Setup:* [Navigate to Data Loading →](#data-loading)  
+*Preliminary Analysis:* [Navigate to Multi-Source Questions →](#preliminary-analysis)  
+*Visual Data Analysis:* [Navigate to Data Visualizations →](#data-visual-analysis)  
+*Rental Cost Analysis:* [Navigate to Rent Burden Metrics →](#rental-cost-burden)  
+*Housing Development Analysis:* [Navigate to Housing Growth →](#t5-development-growth)  
+*YIMBY City Identification:* [Navigate to YIMBY Cities →](#determining-yimby-cities)  
+*Concluding Outputs:* [Navigate to YIMBY Policy Document →](#yimby-policy-document)
+:::
+
+---
+
+### NIMBY vs YIMBY Policy Approaches
+
+::: {.callout-warning icon=false}
+## Essential Terminology
+*NIMBY:* “Not In My Backyard” — resistance to development.  
+*YIMBY:* “Yes In My Backyard” — advocacy for development.  
+*Housing Crisis:* shortage of affordable housing.  
+*CBSA:* Core Based Statistical Area.  
+*Rent Burden:* renters spending >30% income on housing.  
+*Severe Burden:* renters spending >50%.  
+:::
+
+<p style="text-align: left; font-size: 0.7em; color: #666; font-style: italic; margin-top: -10px;">
+Sources: Britannica; US Census Bureau; Investopedia; BEA
+</p>
+
+---
+
+## Data Loading
+
+```{r}
+#| label: Census Dataset Loading
+#| code-fold: true
+#| code-summary: "Display US Census Bureau Loading Code"
+
+if(!dir.exists(file.path("data", "mp02"))){
+  dir.create(file.path("data", "mp02"), showWarnings=FALSE, recursive=TRUE)
+}
+
+verify_package <- function(pkg){
+  pkg <- as.character(substitute(pkg))
+  options(repos = c(CRAN = "https://cloud.r-project.org"))
+  if(!require(pkg, character.only=TRUE, quietly=TRUE)) install.packages(pkg)
+  stopifnot(require(pkg, character.only=TRUE, quietly=TRUE))
+}
+
+verify_package(tidyverse)
+verify_package(glue)
+verify_package(readxl)
+verify_package(tidycensus)
+
+retrieve_acs_data <- function(variable, geography="cbsa",
+                              initial_year=2009, final_year=2023){
+  filename <- glue("{variable}_{geography}_{initial_year}_{final_year}.csv")
+  filename <- file.path("data", "mp02", filename)
+  
+  if(!file.exists(filename)){
+    YEAR_RANGE <- seq(initial_year, final_year)
+    YEAR_RANGE <- YEAR_RANGE[YEAR_RANGE != 2020]
+    
+    COMPLETE_DATA <- map(YEAR_RANGE, function(yr){
+      tidycensus::get_acs(geography, variable, year=yr, survey="acs1") |>
+        mutate(year=yr) |>
+        select(-moe, -variable) |>
+        rename(!!variable := estimate)
+    }) |> bind_rows()
+    
+    write_csv(COMPLETE_DATA, filename)
+  }
+  read_csv(filename, show_col_types=FALSE)
+}
+
+HOUSEHOLD_INCOME <- retrieve_acs_data("B19013_001") |> rename(household_income = B19013_001)
+MONTHLY_RENT <- retrieve_acs_data("B25064_001") |> rename(monthly_rent = B25064_001)
+TOTAL_POPULATION <- retrieve_acs_data("B01003_001") |> rename(population = B01003_001)
+TOTAL_HOUSEHOLDS <- retrieve_acs_data("B11001_001") |> rename(households = B11001_001)
+```
+
+---
+
+```{r}
+#| label: Housing Development Data Loading
+#| code-fold: true
+#| code-summary: "Display Census Housing Development Loading Code"
+
+retrieve_development_permits <- function(initial_year = 2009, final_year = 2023){
+  filename <- glue("housing_developments_{initial_year}_{final_year}.csv")
+  filename <- file.path("data", "mp02", filename)
+  
+  if(!file.exists(filename)){
+    PAST_YEARS <- seq(initial_year, 2018)
+    PAST_DATA <- map(PAST_YEARS, function(yr){
+      past_url <- glue("https://www.census.gov/construction/bps/txt/tb3u{yr}.txt")
+      TEXT_LINES <- readLines(past_url)[-c(1:11)]
+      REGION_LINES <- str_detect(TEXT_LINES, "^[[:digit:]]")
+      REGION_CODE <- as.integer(str_sub(TEXT_LINES[REGION_LINES], 5, 10))
+      AUTHORIZATION_LINES <- str_detect(str_sub(TEXT_LINES, 48, 53), "[[:digit:]]")
+      AUTHORIZATIONS <- as.integer(str_sub(TEXT_LINES[AUTHORIZATION_LINES], 48, 53))
+      data_frame(CBSA = REGION_CODE,
+                 new_housing_units_permitted = AUTHORIZATIONS, 
+                 year = yr)
+    }) |> bind_rows()
+    
+    RECENT_YEARS <- seq(2019, final_year)
+    RECENT_DATA <- map(RECENT_YEARS, function(yr){
+      recent_url <- glue("https://www.census.gov/construction/bps/xls/msaannual_{yr}99.xls")
+      temp_file <- tempfile()
+      download.file(recent_url, destfile = temp_file, mode="wb")
+      data_reader <- function(...){tryCatch(read_xlsx(...), error=function(e) read_xls(...))}
+      data_reader(temp_file, skip=5) |>
+        na.omit() |>
+        select(CBSA, Total) |>
+        mutate(year = yr) |>
+        rename(new_housing_units_permitted = Total)
+    }) |> bind_rows()
+    
+    COMPLETE_PERMITS <- rbind(PAST_DATA, RECENT_DATA)
+    write_csv(COMPLETE_PERMITS, filename)
+  }
+  read_csv(filename, show_col_types=FALSE)
+}
+
+DEVELOPMENT_PERMITS <- retrieve_development_permits()
+```
+
+---
+
+## Preliminary Analysis
+
+```{r}
+#| label: T1Q1 Total 2023 Population
+#| code-fold: true
+#| code-summary: "Display Q1 Analysis Code"
+
+verify_package(scales)
+total_pop_2023 <- TOTAL_POPULATION |> filter(year == 2023) |> summarise(total = sum(population, na.rm = TRUE))
+formatted_total <- scales::comma(total_pop_2023$total)
+```
+
+::: {.callout-tip icon=false}
+**Result:** Total population in 2023 across all CBSAs: *r formatted_total* residents.
+:::
+
+---
+
+```{r}
+#| label: T1Q2 Maximum Rent Region
+#| code-fold: true
+#| code-summary: "Display Q2 Analysis Code"
+
+highest_rent <- MONTHLY_RENT |> filter(year == 2023) |> arrange(desc(monthly_rent)) |> slice(1)
+```
+
+::: {.callout-tip icon=false}
+**Result:** Highest-rent metro: *r highest_rent$NAME* – *r scales::dollar(highest_rent$monthly_rent)* per month.
+:::
+
+---
+
+```{r}
+#| label: T1Q3 Ranking Evolution
+#| code-fold: true
+#| code-summary: "Display Q3 Analysis Code"
+
+verify_package(DT)
+
+population_rankings <- TOTAL_POPULATION |>
+  filter(year %in% c(2009, 2023)) |>
+  group_by(year) |>
+  mutate(rank = rank(-population)) |>
+  ungroup() |>
+  select(GEOID, NAME, year, population, rank) |>
+  pivot_wider(names_from = year, values_from = c(population, rank)) |>
+  mutate(rank_change = rank_2009 - rank_2023,
+         pct_change = (population_2023 - population_2009)/population_2009*100) |>
+  arrange(desc(abs(rank_change))) |>
+  head(15)
+
+datatable(population_rankings, caption="Top 15 Metros by Rank Change (2009–2023)")
+```
+
+---
+
+```{r}
+#| label: T1Q4 Growth Visualization
+#| code-fold: true
+#| code-summary: "Display Growth Chart Code"
+
+verify_package(ggplot2)
+growth <- TOTAL_POPULATION |>
+  filter(year %in% c(2009,2023)) |>
+  select(GEOID,NAME,year,population) |>
+  pivot_wider(names_from=year,values_from=population) |>
+  mutate(growth=((`2023`-`2009`)/`2009`)*100) |>
+  arrange(desc(growth)) |> head(10)
+
+ggplot(growth,aes(x=reorder(NAME,growth),y=growth))+
+  geom_col(fill="#0066cc")+coord_flip()+
+  labs(title="Top 10 Fastest Growing Metros (2009–2023)",x=NULL,y="Growth (%)")+
+  theme_minimal()
+```
+
+---
+
+## Data Visual Analysis
+
+```{r}
+#| label: T2V1 Population-Permits Correlation
+#| code-fold: true
+#| code-summary: "Display Correlation Analysis Code"
+
+pop_change <- TOTAL_POPULATION |>
+  filter(year %in% c(2009,2023)) |>
+  select(GEOID,NAME,year,population) |>
+  pivot_wider(names_from=year,values_from=population) |>
+  mutate(pop_growth=((`2023`-`2009`)/`2009`)*100)
+
+permits <- DEVELOPMENT_PERMITS |>
+  group_by(CBSA) |>
+  summarise(total_permits=sum(new_housing_units_permitted,na.rm=TRUE))
+
+combined <- inner_join(pop_change,permits,by=c("GEOID"="CBSA"))
+
+ggplot(combined,aes(total_permits,pop_growth))+
+  geom_point(alpha=.6,color="#0066cc")+
+  geom_smooth(method="lm",color="#ff6600",se=TRUE)+
+  labs(title="Population Growth vs Housing Permits (2009–2023)",
+       x="Total Permits",y="Population Growth (%)")+
+  theme_minimal()
+```
+
+---
+
+```{r}
+#| label: T2V2 Income-Rent Relationship
+#| code-fold: true
+#| code-summary: "Display Income-Rent Analysis Code"
+
+income_rent_2023 <- HOUSEHOLD_INCOME |>
+  filter(year==2023) |>
+  inner_join(MONTHLY_RENT |> filter(year==2023),by=c("GEOID","NAME","year"))
+
+ggplot(income_rent_2023,aes(household_income,monthly_rent))+
+  geom_point(alpha=.6,color="#ff6600")+
+  geom_smooth(method="lm",color="#0066cc",se=TRUE)+
+  scale_x_continuous(labels=scales::dollar)+
+  scale_y_continuous(labels=scales::dollar)+
+  labs(title="Household Income vs Monthly Rent (2023)",
+       x="Median Income",y="Median Rent ($)")+
+  theme_minimal()
+```
+
+---
+
+## Rental Cost Burden
+
+```{r}
+#| label: T3 Burden Index Calculation
+#| code-fold: true
+#| code-summary: "Display Burden Index Code"
+
+baseline <- HOUSEHOLD_INCOME |>
+  filter(year%in%2009:2012) |>
+  inner_join(MONTHLY_RENT |> filter(year%in%2009:2012),
+             by=c("GEOID","NAME","year")) |>
+  group_by(GEOID,NAME) |>
+  summarise(base_income=mean(household_income,na.rm=TRUE),
+            base_rent=mean(monthly_rent,na.rm=TRUE),.groups="drop") |>
+  mutate(base_ratio=(base_rent*12)/base_income*100)
+nat_base <- mean(baseline$base_ratio,na.rm=TRUE)
+burden_index <- HOUSEHOLD_INCOME |>
+  inner_join(MONTHLY_RENT,by=c("GEOID","NAME","year")) |>
+  mutate(cur_ratio=(monthly_rent*12)/household_income*100,
+         burden_index=(cur_ratio/nat_base)*100)
+```
+
+---
+
+```{r}
+#| label: T3 Highest Burden Regions
+#| code-fold: true
+#| code-summary: "Display Top Burden Areas Code"
+
+verify_package(DT)
+top_burden <- burden_index |> filter(year==2023) |> arrange(desc(burden_index)) |> head(15)
+datatable(top_burden[,c("NAME","household_income","monthly_rent","burden_index")],
+          caption="Top 15 Metros by Rent Burden Index (2023)") |>
+  formatCurrency(c("household_income","monthly_rent"),digits=0) |>
+  formatRound("burden_index",1)
+```
+
+---
+
+```{r}
+#| label: T3 Temporal Burden Trends
+#| code-fold: true
+#| code-summary: "Display Trend Analysis Code"
+
+verify_package(plotly)
+sel <- c("New York","Los Angeles","San Francisco","Miami","Austin","Seattle")
+trend <- burden_index |>
+  filter(str_detect(NAME,paste(sel,collapse="|"))) |>
+  mutate(metro=str_extract(NAME,paste(sel,collapse="|")))
+plt <- ggplot(trend,aes(year,burden_index,color=metro))+
+  geom_line(linewidth=1.2)+
+  geom_hline(yintercept=100,linetype="dashed",color="gray50")+
+  theme_minimal()+
+  labs(title="Rent Burden Index Trends (2009–2023)",y="Index (100 = baseline)")
+ggplotly(plt)
+```
+
+---
+
+## YIMBY Policy Document
+
+Add your PDF policy brief named **policy-document.pdf** to the project folder.
+
+```{r}
+# harmless placeholder so Quarto parses properly
+ggplot(mtcars,aes(mpg,hp))+geom_point()
+```
+
