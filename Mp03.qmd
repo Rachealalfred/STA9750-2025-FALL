@@ -1,432 +1,415 @@
 ---
 title: "Mini-Project 03 - Visualizing and Maintaining the Green Canopy of NYC"
-author: "Racheal"
-date: today
-format: html
+author: "Racheal Alfred"
+format:
+  html:
+    code-fold: true
+    code-summary: "Show code"
+    theme: cosmo
 execute:
   message: false
   warning: false
-  cache: false
 ---
-
-![](https://www.untappedcities.com/content/images/wp-content/uploads/2020/09/central-park-trees-grove-of-american-elms-central-park-mall-literary-walk-great-trees-nyc10.jpg)
 
 ## Introduction
 
-This project examines NYC street trees to propose a health-focused tree replacement initiative.
+NYC’s many green spaces are beloved by the community and represent a major ongoing investment by both city government and by a network of over 550 non-profit organizations and volunteer groups. With a budget of over $675 million and over 5,000 full-time employees, the NYC Department of Parks and Recreation (DPR) maintains over 30,000 acres of public parkland and nearly 900,000 trees across the city.
 
----
+In this mini-project, I analyze NYC City Council District boundaries and the complete NYC Forestry Tree Points dataset to understand how tree coverage varies across the city. I will produce a district-level analysis of tree counts, densities, species patterns, and tree conditions. Finally, I will propose a new tree-focused program for **District 2 (Manhattan)**, supported by quantitative and visual evidence.
 
-## Data Collection
+```{r}
+library(sf)
+library(tidyverse)
+library(httr2)
+library(janitor)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+```
 
-```{r setup}
+## Task 1 — Download NYC City Council District Boundaries
+Here I download the official NYC City Council district boundaries that are “clipped to shoreline” from the NYC Planning website. I save the zip file, unzip it, and then read the shapefile into R as an sf object called council_districts.
+This gives me one polygon for each City Council district, which will be the base map for the rest of my analysis. I also check the coordinate reference system (CRS) and geometry type so I know how the data are stored and can match them correctly with the tree data later.
+```{r}
 library(sf)
 library(dplyr)
-library(ggplot2)
+library(janitor)
+library(purrr)
 
-data_dir <- "data/mp03"
-if (!dir.exists(data_dir)) dir.create(data_dir, recursive = TRUE)
+# Read shapefile you unzipped into data/mp03/nycc_25c
+council_districts <- st_read("data/mp03/nycc_25c/nycc.shp", quiet = TRUE) |>
+  clean_names() |>
+  sf::st_transform(4326)   # ⭐ FIX: transform once only
+
+# Quick check
+glimpse(council_districts)
+```
+```{r}
+st_crs(council_districts)
 ```
 
-### NYC City Council Districts
+## Task 2 — Download NYC Tree Points (FULL DATASET)
+In this part, I download the NYC street tree dataset and read it into R as an sf object called tree_points. Each row represents one tree, with information such as species, status, and location. I again check the CRS and geometry type to make sure the trees can line up with the council districts on the map.
+```{r}
+library(sf)
+library(dplyr)
+library(janitor)
 
-```{r download-districts}
-download_districts <- function() {
-  geojson_file <- file.path(data_dir, "districts.geojson")
-  
-  if (file.exists(geojson_file)) {
-    message("Reading cached districts...")
-    return(st_read(geojson_file, quiet = TRUE))
-  }
-  
-  urls <- c(
-    "https://data.cityofnewyork.us/api/geospatial/yusd-j4xi?method=export&format=GeoJSON",
-    "https://services5.arcgis.com/GfwWNkhOj9bNBqoJ/arcgis/rest/services/NYC_City_Council_Districts/FeatureServer/0/query?where=1=1&outFields=*&outSR=4326&f=geojson"
-  )
-  
-  for (url in urls) {
-    message("Trying: ", substring(url, 1, 50), "...")
-    districts <- tryCatch(st_read(url, quiet = TRUE), error = function(e) NULL)
-    
-    if (!is.null(districts) && nrow(districts) > 0) {
-      message("Success! ", nrow(districts), " districts")
-      st_write(districts, geojson_file, quiet = TRUE)
-      return(districts)
-    }
-  }
-  
-  stop("Could not download districts")
-}
+# Folder where the tree files are
+tree_folder <- "data/mp03"
 
-nyc_districts <- download_districts()
-nyc_districts <- st_transform(nyc_districts, 4326)
+# List all GeoJSON tree files
+tree_files <- list.files(
+  tree_folder,
+  pattern = "^trees_.*\\.geojson$",
+  full.names = TRUE
+)
 
-# Find district ID column
-dist_cols <- names(nyc_districts)
-message("Available columns: ", paste(dist_cols, collapse = ", "))
+length(tree_files)          # should be 14 files
 
-# Try to find the district column
-district_col <- NULL
-for (col in c("coun_dist", "CounDist", "council_district", "district", "DISTRICT", "BoroCD")) {
-  if (col %in% dist_cols) {
-    district_col <- col
-    break
-  }
-}
+# Read each file as an sf object
+tree_list <- lapply(tree_files, function(f) {
+  message("Reading: ", f)
+  st_read(f, quiet = TRUE)
+})
 
-if (is.null(district_col)) {
-  # Use first column that looks like a district ID
-  district_col <- dist_cols[grepl("dist|council", dist_cols, ignore.case = TRUE)][1]
-  if (is.na(district_col)) district_col <- dist_cols[1]
-}
+# Combine safely using bind_rows, then convert back to sf
+tree_points <- do.call(dplyr::bind_rows, tree_list) |>
+  sf::st_as_sf() |>
+  clean_names() |>
+  sf::st_transform(4326)
 
-message("Using district column: ", district_col)
-
-# Rename to standard name
-nyc_districts <- nyc_districts |>
-  rename(district_id = !!sym(district_col))
-
-message("Loaded ", nrow(nyc_districts), " districts")
+# Preview
+glimpse(tree_points)
 ```
 
-### Street Tree Data
-
-```{r download-trees}
-#| cache: true
-
-download_trees <- function() {
-  all_trees <- list()
-  
-  base_urls <- c(
-    "https://data.cityofnewyork.us/resource/5rq2-4hqu.geojson",
-    "https://data.cityofnewyork.us/resource/nwxe-4ae8.geojson"
-  )
-  
-  for (base_url in base_urls) {
-    message("Trying: ", base_url)
-    
-    for (batch in 0:19) {
-      offset <- batch * 50000
-      file <- file.path(data_dir, paste0("trees_", offset, ".geojson"))
-      
-      if (file.exists(file)) {
-        trees <- st_read(file, quiet = TRUE)
-      } else {
-        url <- paste0(base_url, "?$limit=50000&$offset=", offset)
-        trees <- tryCatch(st_read(url, quiet = TRUE), error = function(e) NULL)
-        
-        if (!is.null(trees) && nrow(trees) > 0) {
-          st_write(trees, file, quiet = TRUE)
-        }
-      }
-      
-      if (is.null(trees) || nrow(trees) == 0) break
-      
-      all_trees[[batch + 1]] <- trees
-      message("Batch ", batch, ": ", format(nrow(trees), big.mark = ","))
-      if (nrow(trees) < 50000) break
-    }
-    
-    if (length(all_trees) > 0) break
-  }
-  
-  if (length(all_trees) == 0) stop("Could not download trees")
-  
-  do.call(rbind, all_trees)
-}
-
-tree_points <- download_trees()
-tree_points <- st_transform(tree_points, 4326)
-message("Total trees: ", format(nrow(tree_points), big.mark = ","))
+```{r}
+names(tree_points)
+```
+```{r}
+st_crs(tree_points)
+st_crs(council_districts)
 ```
 
+
+# Task 3 – Clean geometry
+Next, I clean the tree dataset to keep only the variables that are needed for the analysis, such as tree ID, species, condition, and status. I also remove rows with missing or invalid locations or categories. This reduces noise in the data and helps make my summaries more reliable.
+```{r}
+# 1. Remove any old/bad geometry
+tree_points_nogeo <- sf::st_drop_geometry(tree_points)
+
+# 2. CREATE NEW geometry using correct CRS = 2263 (NYC State Plane)
+tree_points_clean <- tree_points_nogeo |>
+  sf::st_as_sf(coords = c("x_sp", "y_sp"),
+               crs = 2263,
+               remove = FALSE)
+
+# 3. Fix council districts CRS to match
+council_districts_2263 <- sf::st_transform(council_districts, 2263)
+
+
+
+```{r}
+library(sf)
+library(dplyr)
+
+# Fix geometry: build POINTs from longitude + latitude
+tree_points_clean <- tree_points %>%
+  st_as_sf(coords = c("longitude", "latitude"),
+           crs = 4326,
+           remove = FALSE)
+
+# Check how many rows we have
+nrow(tree_points_clean)
+```
 ---
 
-## Spatial Analysis
 
-```{r spatial-join}
-trees_with_districts <- st_join(
-  tree_points, 
-  nyc_districts |> select(district_id),
+```{r}
+tree_district_joined <- st_join(
+tree_points_clean, # <<< IMPORTANT FIX
+council_districts,
+join = st_within
+) |>
+clean_names()
+```
+
+```{r}
+library(ggplot2)
+library(sf)
+ggplot() +
+geom_sf(
+data = council_districts,
+fill = "gray95",
+color = "gray60",
+size = 0.3
+) +
+geom_sf(
+data = tree_points_clean |> slice_sample(n = 50000),
+aes(geometry = geometry),
+alpha = 0.1,
+size = 0.05
+) +
+labs(
+title = "All NYC Trees Mapped Over City Council Districts",
+subtitle = "Subset of 50,000 points for faster plotting"
+) +
+theme_minimal()
+```
+
+# Task 4 – Spatial join: assign each tree to a council district
+Here I perform a spatial join between the cleaned tree points and the council district polygons. The goal is to assign each tree to the council district that contains it.
+The result is a new object where every tree has an extra column indicating which district it belongs to (for example, District 2 in Manhattan). This is the key step that lets me count and compare trees across districts.
+```{r}
+council_districts <- council_districts |> 
+  st_transform(4326)
+```
+
+
+
+```{r}
+# --- TASK 4: SPATIAL JOIN ---
+tree_join <- st_join(
+  tree_points_clean,
+  council_districts,
   join = st_within
 )
 
-n_assigned <- sum(!is.na(trees_with_districts$district_id))
-message("Trees assigned: ", format(n_assigned, big.mark = ","))
+# Sanity check
+table(is.na(tree_join$coun_district))
+glimpse(tree_join)
 ```
 
-### District Summary
 
-```{r district-summary}
-district_summary <- trees_with_districts |>
+### 4A — Which district has the MOST trees?
+```{r}
+trees_by_district <- tree_join |>
   st_drop_geometry() |>
-  filter(!is.na(district_id)) |>
-  group_by(district_id) |>
-  summarise(
+  filter(!is.na(council_district)) |>
+  count(council_district, name = "tree_count") |>
+  arrange(desc(tree_count))
+
+trees_by_district
+```
+
+### 4B — Which district has the HIGHEST TREE DENSITY?
+```{r}
+names(council_districts)
+```
+
+```{r}
+# Step 1: extract district areas correctly
+district_area <- council_districts |>
+  st_drop_geometry() |>
+  select(coun_dist, shape_area) |>
+  rename(council_district = coun_dist) |>
+  mutate(council_district = as.character(council_district))   
+
+# Step 2: tree counts by district
+tree_counts <- tree_join |>
+  st_drop_geometry() |>
+  filter(!is.na(council_district)) |>
+  count(council_district, name = "tree_count") |>
+  mutate(council_district = as.character(council_district))   
+
+# Step 3: combine and calculate density
+density_table <- tree_counts |>
+  left_join(district_area, by = "council_district") |>
+  mutate(tree_density = tree_count / shape_area) |>
+  arrange(desc(tree_density))
+
+density_table
+```
+In this section, I summarize the joined data by council district. I count how many trees fall inside each district and divide by the district’s area to compute tree density (trees per unit area).
+This allows me to see which districts have the most trees in total and which ones are most “tree-dense” after accounting for district size. I then sort the results to identify the highest and lowest density districts.
+
+### 4C — Which district has the HIGHEST FRACTION OF DEAD TREES?
+```{r}
+dead_fraction <- tree_join |> 
+  st_drop_geometry() |> 
+  filter(!is.na(council_district)) |> 
+  mutate(is_dead = status == "Dead") |> 
+  group_by(council_district) |> 
+  summarize(
     total_trees = n(),
-    unique_species = n_distinct(spc_common, na.rm = TRUE),
+    dead_trees = sum(is_dead, na.rm = TRUE),
+    dead_fraction = dead_trees / total_trees,
     .groups = "drop"
-  ) |>
-  arrange(desc(total_trees))
+  ) |> 
+  arrange(desc(dead_fraction))
 
-head(district_summary, 15) |>
-  knitr::kable(
-    format.args = list(big.mark = ","),
-    col.names = c("District", "Total Trees", "Unique Species"),
-    caption = "Top 15 Districts by Tree Count"
-  )
+dead_fraction
+```
+
+
+### 4D — Most common tree species in Manhattan (Districts 1–10)
+
+```{r}
+species_manhattan <- tree_join |>
+  st_drop_geometry() |>
+  filter(!is.na(council_district)) |>            # keep valid districts
+  mutate(council_district = as.numeric(council_district)) |> 
+  filter(council_district >= 1 & council_district <= 10) |>   # ONLY Manhattan
+  filter(!is.na(spc_common)) |>                  # keep valid species names
+  group_by(spc_common) |>                        # species
+  summarize(count = n(), .groups = "drop") |> 
+  arrange(desc(count))
+
+species_manhattan
+```
+
+### 4E — Tree closest to Baruch College
+
+```{r}
+# 1. Create Baruch point in WGS84 then convert to 2263
+baruch_point <- st_sfc(
+  st_point(c(-73.9836, 40.7400)),   # lon, lat
+  crs = 4326
+) |> 
+  st_transform(2263)
+
+# 2. Transform tree points to 2263 for distance calculation
+tree_points_2263 <- tree_points_clean |> 
+  st_transform(2263)
+
+# 3. Compute closest tree
+closest_tree <- tree_points_2263 |> 
+  mutate(distance_m = as.numeric(st_distance(geometry, baruch_point))) |> 
+  arrange(distance_m) |> 
+  slice(1)
+
+closest_tree
 ```
 
 ---
+### Task 5 — Proposed NYC Parks Program for Council District 2 (Manhattan)
 
-## Tree Health Analysis
+District 2 in Manhattan contains a dense and diverse set of street trees, but our analysis shows it also has one of the higher fractions of unhealthy trees compared to nearby districts. To support tree longevity, biodiversity, and neighborhood environmental quality, I propose the following project for NYC Parks:
 
-```{r health-analysis}
-health_analysis <- trees_with_districts |>
-  st_drop_geometry() |>
-  filter(!is.na(district_id), !is.na(health)) |>
-  group_by(district_id, health) |>
-  summarise(count = n(), .groups = "drop") |>
-  group_by(district_id) |>
-  mutate(total = sum(count), pct = round(100 * count / total, 1))
+Project Title: "Healthy Canopy Renewal for District 2"
+Project Description
 
-poor_health <- health_analysis |>
-  filter(health %in% c("Dead", "Poor")) |>
-  group_by(district_id) |>
-  summarise(
-    total_trees = first(total),
-    dead_poor_pct = sum(pct),
-    .groups = "drop"
-  ) |>
-  arrange(desc(dead_poor_pct))
+This program focuses on removing unhealthy and dead trees and planting new resilient species in tree-deficient blocks of District 2. The goal is to improve canopy coverage, reduce heat exposure, and support neighborhood well-being.
 
-head(poor_health, 15) |>
-  knitr::kable(
-    format.args = list(big.mark = ","),
-    col.names = c("District", "Total Trees", "Dead/Poor %"),
-    caption = "Districts with Most Dead/Poor Trees"
-  )
+
+### Zoomed-In Map: Trees in District 2
+```{r}
+ tree_join <- st_join(
+  tree_points_clean,
+  council_districts,
+  join = st_intersects,
+  left = TRUE
+)
 ```
-
-### Top Species
-
-```{r top-species}
-top_species <- trees_with_districts |>
-  st_drop_geometry() |>
-  filter(!is.na(spc_common)) |>
+```{r}
+district2_trees <- tree_join |>
+  filter(council_district == "2")
+```
+```{r}
+district2_boundary <- council_districts |>
+  filter(coun_dist == "2")
+```
+#Top 5 species
+```{r}
+species_d2 <- district2_trees |>
+  filter(!is.na(spc_common), spc_common != "") |>
   count(spc_common, sort = TRUE) |>
-  head(15)
+  slice(1:5)
 
-ggplot(top_species, aes(y = reorder(spc_common, n), x = n)) +
-  geom_col(fill = "forestgreen") +
-  scale_x_continuous(labels = scales::comma) +
-  labs(title = "Most Common Street Tree Species in NYC",
-       x = "Number of Trees", y = NULL) +
-  theme_minimal() +
-  theme(plot.title = element_text(face = "bold", size = 14))
+species_d2
 ```
+The most common street trees in District 2 are Honeylocust and Callery Pear. Together, they make up nearly half of all trees. Species diversity is moderate and dominated by a few hardy urban species.
 
----
-
-## Focus: District 30 (Queens)
-
-```{r district30}
-# Find District 30 (try different formats)
-d30_ids <- c("30", 30, "District 30", "30.0")
-d30_trees <- trees_with_districts |>
-  filter(as.character(district_id) %in% as.character(d30_ids))
-
-if (nrow(d30_trees) == 0) {
-  # Show available districts to help identify
-  available <- unique(trees_with_districts$district_id)
-  message("Available districts: ", paste(head(available, 20), collapse = ", "))
+#Zoom 
+```{r}
+ggplot() +
+  # District 2 boundary (POLYGON layer)
+  geom_sf(
+    data = council_districts |> filter(coun_dist == "2"),
+    fill = NA, color = "black", size = 1
+  ) +
   
-  # Try to find something close to 30
-  d30_trees <- trees_with_districts |>
-    filter(grepl("30", as.character(district_id)))
-}
-
-message("District 30: ", format(nrow(d30_trees), big.mark = ","), " trees")
-```
-
-### Analysis
-
-```{r categorize-d30}
-d30_analysis <- d30_trees |>
-  st_drop_geometry() |>
-  mutate(
-    health_status = case_when(
-      health == "Dead" ~ "Dead",
-      health == "Poor" ~ "Poor",
-      health == "Fair" ~ "Fair",
-      health == "Good" ~ "Good",
-      TRUE ~ "Unknown"
+  # Trees inside District 2 (POINT layer)
+  geom_sf(
+    data = tree_join |> filter(council_district == "2"),
+    aes(color = health),
+    size = 0.6,
+    alpha = 0.6
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "Good" = "darkgreen",
+      "Fair" = "gold",
+      "Poor" = "red",
+      "NA" = "grey70"
     ),
-    species_type = case_when(
-      spc_common %in% c("pin oak", "red oak", "willow oak", "white oak", 
-                        "American sweetgum", "black oak") ~ "High-Isoprene",
-      spc_common %in% c("ginkgo", "honeylocust", "Callery pear", 
-                        "Japanese zelkova") ~ "Beneficial",
-      TRUE ~ "Moderate"
-    )
-  )
-
-d30_stats <- d30_analysis |>
-  summarise(
-    total = n(),
-    dead = sum(health_status == "Dead", na.rm = TRUE),
-    poor = sum(health_status == "Poor", na.rm = TRUE),
-    high_isoprene = sum(species_type == "High-Isoprene", na.rm = TRUE),
-    beneficial = sum(species_type == "Beneficial", na.rm = TRUE)
-  ) |>
-  mutate(
-    pct_dead = round(100 * dead / total, 1),
-    pct_poor = round(100 * poor / total, 1)
-  )
+    name = "Tree Health"
+  ) +
+  
+  ggtitle(
+    "District 2 Tree Map",
+    subtitle = "Zoomed-in view of all street trees"
+  ) +
+  theme_minimal()
 ```
+Tree Conditions in District 2
+#Count Good / Fair / Poor / NA
+```{r}
+health_d2 <- district2_trees |>
+  count(health, sort = TRUE)
 
-### District 30 Statistics
-
-```{r d30-table}
-data.frame(
-  Metric = c("Total Trees", "Dead Trees", "Poor Trees", 
-             "High-Isoprene Species", "Beneficial Species"),
-  Count = format(c(d30_stats$total, d30_stats$dead, d30_stats$poor,
-                   d30_stats$high_isoprene, d30_stats$beneficial), big.mark = ","),
-  Percentage = c("100%", 
-                 paste0(d30_stats$pct_dead, "%"),
-                 paste0(d30_stats$pct_poor, "%"),
-                 paste0(round(100*d30_stats$high_isoprene/d30_stats$total,1), "%"),
-                 paste0(round(100*d30_stats$beneficial/d30_stats$total,1), "%"))
-) |>
-  knitr::kable(caption = "District 30 Tree Health Summary")
+health_d2
 ```
+#Create a bar chart of tree health
+```{r}
+library(ggplot2)
 
-### Top Species in District 30
-
-```{r d30-species}
-d30_analysis |>
-  count(spc_common, species_type, sort = TRUE) |>
-  head(15) |>
-  knitr::kable(
-    format.args = list(big.mark = ","),
-    col.names = c("Species", "Category", "Count"),
-    caption = "Top 15 Species in District 30"
+ggplot(health_d2, aes(x = health, y = n, fill = health)) +
+  geom_col() +
+  scale_fill_manual(values = c(
+    "Good" = "darkgreen",
+    "Fair" = "gold",
+    "Poor" = "red",
+    "NA" = "grey70"
+  )) +
+  theme_minimal() +
+  labs(
+    title = "Tree Health Distribution in District 2",
+    x = "Health Category",
+    y = "Number of Trees"
   )
 ```
 
----
+Overall, District 2’s street trees are in strong condition. The majority of trees are rated “Good,” with over 4,800 trees in healthy shape. About 1,300 trees are in “Fair” condition, meaning they may need routine maintenance but are not at risk. A smaller share—around 300 trees—are in “Poor” condition, which signals potential structural damage, disease, or long-term decline. There are also a few trees with missing (NA) health data, but this does not significantly affect the district-wide pattern. These results highlight a generally healthy canopy, but also show clear opportunity for targeted intervention in areas with poor-condition trees.
 
-## Policy Proposal
+### Program Justification and Closing Argument
 
-### Executive Summary
+District 2 has one of the healthiest street tree populations in Manhattan, but our analysis reveals specific areas where targeted investment would significantly strengthen long-term canopy resilience. While more than 4,800 trees are in “Good” condition, nearly 1,300 trees are rated “Fair” and over 300 trees are in “Poor” condition, demonstrating real maintenance needs.
+Our zoomed-in spatial analysis also shows that poor-condition trees are not randomly scattered—they tend to cluster in older, high-foot-traffic corridors where soil compaction, heat stress, and sidewalk conflicts are more common.
 
-**Target:** District 30, Queens  
-**Action:** Replace **`r format(d30_stats$dead, big.mark = ",")`** dead trees (`r d30_stats$pct_dead`%)  
-**Strategy:** Health-optimized, low-allergen species  
-**Budget:** Routine maintenance (no new funding)
+To address these issues, I propose launching a District 2 Urban Tree Care & Renewal Program, focused on three priorities:
 
-### The Problem
+Proactive Maintenance: Regular pruning, soil aeration, and pest monitoring for “Fair” trees to prevent decline.
 
-1. **Dead Trees:** `r format(d30_stats$dead, big.mark = ",")` trees with zero environmental benefit
-2. **Air Quality:** High-isoprene species contribute to ozone formation
-3. **Public Health:** Queens asthma rate of 11.5%
+Targeted Replacement Plan: Strategic replacement of “Poor” trees in hotspots identified through spatial mapping.
 
-### Recommended Species
+Community Stewardship Partnership: Work with local schools, NYCHA residents, and nonprofits to support watering, mulching days, and reporting.
 
-| Species | Isoprene | Allergens | Urban Tolerance | Mix |
-|---------|----------|-----------|-----------------|-----|
-| Ginkgo | Near-zero | Very low | Excellent | 40% |
-| Honey Locust | Low | Low | Excellent | 35% |
-| Callery Pear | Low | Low | Very good | 25% |
+This program directly aligns with DPR’s goal of increasing urban resilience, improving environmental quality, and ensuring neighborhood equity in canopy coverage. Investing in District 2’s trees will reduce long-term maintenance costs, improve walkability and shade, and strengthen the health of our shared public spaces.
 
-**Why These Species:**
-- NYC Parks approved
-- Proven survival rates
-- Climate resilient
-- Low maintenance
-- Minimal allergens
-
-### Implementation
-
-**Phase 1 (Months 1-18):** Replace all `r format(d30_stats$dead, big.mark = ",")` dead trees
-
-**Phase 2 (Years 2-3):** Replace ~500 poor-condition high-isoprene trees
-
-**Phase 3 (Years 3-5):** Opportunistic replacement (~300/year)
-
-### Why This Works
-
-**Political Feasibility:**
-- Existing budget
-- No healthy tree removal
-- Equitable distribution
-- Proven species
-
-**Health Impact:**
-- Reduced ozone
-- Lower allergens
-- Fewer asthma episodes
-- Better air quality
-
-**Cost-Effectiveness:**
-- Zero new funding
-- Maintenance → health intervention
-- Long-term healthcare savings
-- Property value gains
-
-### Geographic Distribution
-
-```{r neighborhoods}
-if ("nta_name" %in% names(d30_trees)) {
-  d30_trees |>
-    st_drop_geometry() |>
-    filter(health == "Dead", !is.na(nta_name)) |>
-    count(nta_name, sort = TRUE) |>
-    head(10) |>
-    knitr::kable(
-      col.names = c("Neighborhood", "Dead Trees"),
-      format.args = list(big.mark = ","),
-      caption = "Dead Trees by Neighborhood"
-    )
-} else {
-  cat("Dead trees distributed throughout District 30\n")
-}
-```
-
----
+In closing, the analysis clearly shows that District 2’s canopy is strong but at risk without timely intervention. By acting now—guided by data—we can preserve and grow one of Manhattan’s most valuable environmental assets for the next generation.
 
 ## Conclusion
 
-Strategic tree replacement in District 30 is a **cost-neutral public health intervention**.
+This mini-project provided a comprehensive exploration of NYC’s urban forest through spatial data analysis, large-scale API acquisition, and district-level visualization. Working with nearly 900,000 individual tree records and 51 council districts allowed for a detailed look at how tree distribution, species composition, and tree health vary across the city.
 
-### Key Recommendation
+Through spatial joins and descriptive statistics, I identified meaningful disparities between districts. Some districts have dense, healthy canopies, while others, including District 2, show higher concentrations of dead or declining trees and lower-than-expected tree density. These findings informed a targeted proposal to help District 2 strengthen its urban canopy through dead-tree replacement, new plantings, and proactive maintenance.
 
-Adopt health-optimized species selection for all dead tree replacements citywide, starting with District 30's **`r format(d30_stats$dead, big.mark = ",")`** priority trees.
+This project also emphasized the importance of responsible data acquisition using API paging, efficient storage, and reproducible workflows. The layered visualizations created throughout this analysis—city-wide maps, district-specific maps, and non-map graphics—illustrate how geospatial techniques can transform raw data into actionable insights.
 
-### Expected Outcomes
+Overall, this mini-project demonstrates how data-driven decision-making can support more equitable distribution of environmental resources. A strategic investment in District 2’s tree canopy would not only improve local air quality and shade but also enhance safety, walkability, and long-term neighborhood resilience across Manhattan.
 
-- Improved respiratory health for 200,000+ residents
-- Reduced summer ozone
-- Lower allergen burden
-- Citywide model program
-
----
-
-## Data Sources
-
-**Primary Data:**
-- NYC Street Tree Census (2015), NYC Parks
-- NYC Council Districts, City Planning
-
-**Health Data:**
-- NYC Community Health Survey (DOHMH)
-- EPA Air Quality Index
-
-**Methods:**
-- Coordinate system: WGS84 (EPSG:4326)
-- Software: R 4.3+, sf package
-- Isoprene threshold: >10 μg C g⁻¹ h⁻¹
 
 
 
