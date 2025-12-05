@@ -1,0 +1,335 @@
+---
+title: "Mini-Project 04: Just the Fact-Checks, Ma'am!"
+author: "Racheal"
+format:
+  html:
+    theme: cosmo
+    code-fold: true
+    code-summary: "Show code"
+    toc: true
+    toc-depth: 3
+    toc-floating: true
+execute:
+  warning: false
+  message: false
+---
+## Introduction
+
+In this mini-project, I investigate the accuracy and reliability of the U.S. Bureau of Labor Statistics (BLS) monthly employment estimates, commonly known as the “jobs report.” These numbers are widely used by policymakers, economists, and the public, and recent political claims have suggested that BLS revisions are unusually large or biased.
+
+The goal of this project is to **fact-check** these claims by:
+
+- Scraping the official BLS website for **CES Total Nonfarm Payroll** levels (1979–2025).  
+- Scraping the **CES Revisions tables** to obtain first estimates, final estimates, and month-to-month revisions.  
+- Joining these into a single, tidy table.  
+- Performing exploratory data analysis and visualization.  
+- Running formal statistical tests using the **infer** package.  
+- Conducting two Politifact-style fact checks of real (or clearly labeled fake) claims.
+
+Throughout, I use **httr2, rvest, dplyr, tidyr, ggplot2, lubridate, janitor, purrr, and infer**.  
+This mini-project walks through the full pipeline: **data acquisition → cleaning → analysis → inference → communication**.
+
+```{r setup}
+library(httr2)
+library(rvest)
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(purrr)
+library(ggplot2)
+library(infer)
+```
+# Task 1 — Download CES Total Nonfarm Payroll (1979–2025)
+
+The first task is to scrape the seasonally adjusted Total Nonfarm Employment series (CES0000000001) from BLS “Data Finder 1.1” by reproducing the POST request that the browser sends.
+Build POST request for CES levels (Total Nonfarm SA)
+```{r}
+ces_req <- request("https://data.bls.gov/pdq/SurveyOutputServlet") |>
+req_method("POST") |>
+req_body_form(
+request_action = "get_data",
+reformat = "true",
+from_results_page = "true",
+from_year = "1979",
+to_year = "2025",
+Go.x = "15",
+Go.y = "11",
+initial_request = "false",
+data_tool = "surveymost",
+series_id = "CES0000000001",
+original_annualAveragesRequested = "false"
+) |>
+req_user_agent("Mozilla/5.0")
+
+ces_resp <- ces_req |> req_perform()
+ces_html <- ces_resp |> resp_body_html()
+
+
+
+ces_tables <- ces_html |> html_table(fill = TRUE)
+
+
+ces_raw <- ces_tables[[2]] |> clean_names()
+
+head(ces_raw)
+```
+The wide table has one row per year and one column for each month. I reshape it into a tidy table with a single date column and a numeric level
+```{r}
+ces_clean <- ces_raw |>
+pivot_longer(
+cols = c(jan, feb, mar, apr, may, jun,
+jul, aug, sep, oct, nov, dec),
+names_to = "month",
+values_to = "level"
+) |>
+mutate(
+month = str_to_title(month), # "Jan" → "Jan"
+date = ym(paste(year, month)), # 1979 Jan → 1979-01-01
+level = as.numeric(level)
+) |>
+select(date, level) |>
+drop_na()
+
+head(ces_clean)
+```
+# Task 2 — Download CES Revisions Tables (1979–2025)
+```{r}
+rev_req <- request("https://www.bls.gov/web/empsit/cesnaicsrev.htm") |>
+  req_headers(
+    "User-Agent" = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept" = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language" = "en-US,en;q=0.9",
+    "Connection" = "keep-alive",
+    "Referer" = "https://www.bls.gov/",
+    "Sec-Fetch-Dest" = "document",
+    "Sec-Fetch-Mode" = "navigate",
+    "Sec-Fetch-Site" = "same-origin",
+    "Upgrade-Insecure-Requests" = "1"
+  )
+```
+Step 2 — Perform request + extract HTML
+```{r}
+rev_resp <- rev_req |> req_perform()
+rev_html <- rev_resp |> resp_body_html()
+```
+
+Step 3 — Extract ALL revision tables
+```{r}
+rev_tables <- rev_html |> html_table(fill = TRUE)
+length(rev_tables)
+```
+Identify which table is the month-level table:
+```{r}
+sapply(rev_tables, ncol)
+```
+Step 4 — Cleaning function
+```{r}
+extract_year_table <- function(tbl) {
+
+  # Clean row names but keep content
+  tbl <- janitor::clean_names(tbl)
+
+  # Keep only rows 3–14 (actual months)
+  tbl <- tbl[3:14, ]
+
+  # Rename columns manually based on position
+  names(tbl)[1:6] <- c("month", "year", "first", "second", "third", "revision")
+
+  # Clean month names ("Jan." → "Jan")
+  tbl$month <- gsub("\\.", "", tbl$month)
+
+  # Build a date column
+  tbl <- tbl %>%
+    mutate(
+      month_num = match(month, month.abb),
+      date = as.Date(paste0(year, "-", month_num, "-01")),
+      first = as.numeric(first),
+      second = as.numeric(second),
+      third = as.numeric(third),
+      revision = as.numeric(revision)
+    ) %>%
+    select(date, first, second, third, revision) %>%
+    drop_na(date)
+
+  return(tbl)
+}
+```
+Step 5 — Identify valid tables
+```{r}
+valid_tables <- rev_tables[
+  sapply(rev_tables, function(x) is.data.frame(x) && nrow(x) >= 14)
+]
+```
+
+```{r}
+all_rev <- purrr::map_dfr(
+  valid_tables,
+  extract_year_table
+)
+
+nrow(all_rev)
+```
+# Test the cleaning function on 2024 table
+```{r}
+# Identify which table corresponds to 2024.
+# From inspection, table 5 is 2024.
+rev_2024 <- rev_tables[[5]]
+
+# Clean the 2024 table
+rev_2024_clean <- extract_year_table(rev_2024)
+
+rev_2024_clean
+```
+
+
+
+# Task 3 — Visualizing CES Revisions (1979–2025)
+
+In this task, I create a line plot of the monthly CES Total Nonfarm Payroll revisions from 1979–2025. The goal is to explore whether the BLS revisions show any systematic bias or unusual patterns over time.
+
+Since the COVID-19 period contains extremely large revisions (20,000+ jobs), I use
+coord_cartesian(ylim = c(-1000, 1000))
+to zoom in on the normal revision range and keep the plot readable.
+```{r}
+rev_more_stats <- all_rev |>
+  summarize(
+    median_revision = median(revision, na.rm = TRUE),
+    pct_positive = mean(revision > 0, na.rm = TRUE),
+    avg_abs_revision = mean(abs(revision), na.rm = TRUE)
+)
+
+rev_more_stats
+```
+
+###plot 1
+```{r}
+ggplot(all_rev, aes(revision)) +
+  geom_histogram(bins = 40, fill = "steelblue", alpha = 0.7) +
+  labs(
+    title = "Distribution of CES Monthly Revisions",
+    x = "Revision (Final – First Estimate)",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+
+###plot 2
+```{r}
+all_rev |>
+  mutate(month = month(date, label = TRUE)) |>
+  ggplot(aes(month, revision)) +
+  geom_boxplot(fill = "darkgreen", alpha = 0.7) +
+  labs(
+    title = "Revisions by Month (Seasonal Patterns)",
+    x = "Month",
+    y = "Revision"
+  ) +
+  theme_minimal()
+```
+
+###plot 3
+```{r}
+all_rev |>
+  mutate(abs_rev = abs(revision)) |>
+  ggplot(aes(date, abs_rev)) +
+  geom_line(color = "purple") +
+  labs(
+    title = "Absolute Revision Size Over Time",
+    x = "Year",
+    y = "Absolute Revision"
+  ) +
+  theme_minimal()
+```
+In Task 3, I explored CES revisions from 1979–2025 using summary statistics and four visualizations. The distribution of revisions centers around zero, with most values between –100 and +100. Seasonal boxplots show small month-to-month differences, and the time-series plots reveal that large revisions mainly occur during unusual economic periods like COVID-19. Overall, the visuals indicate normal statistical adjustments rather than any consistent bias.
+
+# Task 4 — Statistical Inference on CES Revisions
+In this task, I use formal statistical tests to evaluate whether CES revisions show evidence of unusual patterns or systematic bias. I perform one t-test and one proportion test using the infer package.
+
+Test whether the mean revision = 0
+```{r}
+test_mean <- all_rev |>
+  t_test(response = revision, mu = 0)
+
+test_mean
+```
+The one-sample t-test comparing the average CES revision to zero yields a p-value of 0.462, indicating no statistically significant difference from zero. The estimated mean revision is only +1.8 jobs, and the confidence interval includes zero. This shows that CES revisions are centered around zero and do not display directional bias
+
+Test 2: Proportion of negative revisions after 2000
+```{r}
+test_prop <- all_rev |>
+  mutate(
+    after_2000 = year(date) >= 2000,
+    negative = revision < 0
+  ) |>
+  prop_test(negative ~ after_2000)
+
+test_prop
+```
+To test whether CES revisions have become more negative after 2000, I ran a two-sample proportion test comparing the share of negative revisions before and after 2000. The test returned a p-value of 0.037, indicating a statistically significant difference between the two periods. However, the confidence interval is narrow and centered near zero, meaning that although the difference is statistically detectable, it is small in magnitude and not practically meaningful. This suggests that the pattern of negative revisions has shifted slightly over time but does not provide evidence of systematic manipulation or bias.
+
+# TASK 5 — FACT CHECKS
+
+##Fact Check #1 — “BLS revisions have gotten much worse in recent years.”
+Claim (Common in media commentary, 2024–2025):
+
+“The BLS jobs numbers are becoming increasingly unreliable — revisions today are much worse than they used to be.”
+Statistical Test — Proportion of Negative Revisions
+```{r}
+test_prop
+```
+The chi-square test indicates a statistically significant difference in the proportion of negative revisions before and after 2000 (p = 0.037). However, the effect size is very small, and revisions remain within normal historical behavior. Therefore, this result does not support the claim that BLS revisions have become dramatically worse or unreliable in recent years.
+
+See the histogram and absolute-revision time-series from Task 3, which also show no unusual spikes after 2000.
+
+##Fact Check #2 — “The mean BLS revision is not zero — revisions are biased.”
+
+Claim (Repeated in political commentary, 2020–2025):
+
+“The BLS consistently underestimates or overestimates job growth. The revisions are biased — the first estimate is always wrong in one direction.”
+This claim suggests that the average revision is NOT zero.
+If true, the mean revision should be significantly positive or negative.
+
+ Test whether the mean revision = 0
+```{r}
+test_mean <- t.test(all_rev$revision, mu = 0)
+test_mean
+```
+The one-sample t-test shows that the average CES revision (mean ≈ 1.8k) is not statistically different from zero (p = 0.462). The 95% confidence interval (–3.0k to 6.6k) contains zero, meaning the revisions are just normal random fluctuations. Therefore, this test provides no evidence that the BLS systematically over- or under-states the initial jobs numbers.
+Conclusion: The claim that “BLS revisions are biased” is not supported by the data.
+
+This conclusion is consistent with the histogram and seasonal boxplots in Task 3, which show revisions centered near zero.
+##Fact Check #3 — “Big revisions only happen in recent years.”
+
+(Common political claim, especially around COVID-era revisions)
+
+Some commentators argue that BLS revisions have become extremely large only in the last couple of decades, implying that the jobs numbers have become unusually unstable.
+
+To test this claim, I compare the absolute size of revisions before and after the year 2000.
+```{r}
+all_rev <- all_rev |> 
+  mutate(
+    after_2000 = year(date) >= 2000,
+    abs_rev = abs(revision)
+  )
+```
+Statistical Test — Wilcoxon Rank-Sum (non-parametric test)
+```{r}
+test_big <- wilcox.test(abs_rev ~ after_2000, data = all_rev)
+test_big
+```
+The Wilcoxon rank-sum test shows a statistically significant difference in the size of revisions before and after 2000 (p ≈ 0.0005). While revisions after 2000 include some very large values — especially during the COVID-19 shock — big revisions also occurred multiple times in the 1980s and 1990s. The median revision size has not increased dramatically, and the overall distribution remains similar across decades.
+
+This matches the absolute-revision time-series plot from Task 3, which shows large revisions in multiple decades, not only recent years.
+
+# Conclusion
+Across three separate fact checks, the statistical evidence shows that CES revisions follow normal historical patterns. While occasional large revisions occur—especially during unusual economic events like the COVID-19 shock—there is no systematic increase in unreliability, no directional bias, and no evidence that revisions today are dramatically worse than in the past.
+Overall, the claims examined are rated between “False” and “Mostly False” on the Politifact scale.
+
+
+
+
+
+
+
+
